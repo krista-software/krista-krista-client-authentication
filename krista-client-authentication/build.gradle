@@ -1,0 +1,232 @@
+import java.util.regex.Pattern
+
+plugins {
+    id 'java-library'
+    id 'jacoco'
+    id 'maven-publish'
+    id("org.sonarqube") version "6.3.1.5724"
+}
+
+group = 'app.krista.extensions'
+version = project.findProperty('extensionVersion') ?: '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+sonar {
+    properties {
+        property('sonar.projectName', 'SonarScanner for Krista Global Catalog (outlook-3.0 with Jacoco code coverage)')
+        property("sonar.projectKey", "sonar-scanner-outlook-3.0")
+        property("sonar.sources", "src/main/java")
+        property("sonar.tests", "src/test/java")
+        property("sonar.java.binaries", "build/classes/java/main")
+        property("sonar.java.test.binaries", "build/classes/java/test")
+        property("sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/test/jacocoTestReport.xml")
+        property("sonar.junit.reportPaths", "build/test-results/test")
+    }
+}
+
+tasks.test {
+    // Generate coverage report after tests run
+    finalizedBy(tasks.jacocoTestReport)
+}
+jacoco {
+    toolVersion = "0.8.11"
+}
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required = true   // Required for SonarQube
+        html.required = true  // Useful for local viewing
+        csv.required = false
+    }
+}
+// Ensure Sonar runs only after JaCoCo report generation
+tasks.named("sonar") {
+    dependsOn(tasks.jacocoTestReport)
+}
+
+def computedBaseName = "Krista Client Authentication"
+def computedVersion = "local"
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+            println "✔ Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("⚠ release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+// Repositories inherited from root build.gradle
+
+dependencies {
+    // Internal project dependencies
+    implementation project(':base-authentication')
+
+    // Krista API Dependencies (compileOnly - provided at runtime)
+    compileOnly 'app.krista:krista-apis:1.0.121-rc1'
+    compileOnly 'org.glassfish.hk2:hk2-api:3.0.5'
+
+    // Common Dependencies
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.slf4j:slf4j-api:2.0.9'
+
+    // JAX-RS API
+    compileOnly 'jakarta.ws.rs:jakarta.ws.rs-api:3.1.0'
+    compileOnly 'jakarta.inject:jakarta.inject-api:2.0.1'
+
+    // Test Dependencies
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter-params:5.10.0'
+    testImplementation 'org.mockito:mockito-core:5.5.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.5.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // Test-only Krista APIs
+    testImplementation 'app.krista:krista-apis:1.0.121-rc1'
+}
+
+abstract class GenerateReleasePropertiesTask extends DefaultTask {
+    @TaskAction
+    def generateProperties() {
+
+        def extensionFilePath = 'src/main/java/app/krista/extensions/authentication/krista_client_authentication/KristaClientAuthenticationExtension.java'
+        def extensionFile = project.file(extensionFilePath)
+        if (!extensionFile.exists()) {
+            throw new GradleException("Extension file not found: ${extensionFilePath}")
+        }
+
+        def properties = new Properties()
+// Pre-compile the regex pattern for better performance
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+// Extract Extension annotation information
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "name") {
+                properties.setProperty("extension.name", value)
+                logger.lifecycle("Found extension name: ${value}")
+            } else if (key == "version") {
+                properties.setProperty("extension.version", value)
+                logger.lifecycle("Found extension version: ${value}")
+            }
+        }
+// Extract Domain annotation information
+        extractAnnotationInfo(extensionFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") {
+                properties.setProperty("domain.name", value)
+                logger.lifecycle("Found domain name: ${value}")
+            } else if (key == "ecosystemName") {
+                properties.setProperty("ecosystem.name", value)
+                logger.lifecycle("Found ecosystem name: ${value}")
+            }
+        }
+
+
+        if (!properties.getProperty('extension.version')) {
+            throw new GradleException("Could not find extension version in ${extensionFilePath}")
+        }
+        if (!properties.getProperty('domain.name') || !properties.getProperty('ecosystem.name')) {
+            throw new GradleException("Could not find domain name or ecosystem name in ${extensionFile}")
+        }
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties with content:\n${content}")
+    }
+/**
+ * Extracts annotation information from a file
+ * @param file The file to extract from
+ * @param annotationName The annotation name to look for
+ * @param keyValuePattern The regex pattern to extract key-value pairs
+ * @param processProperty Closure to process each property
+ */
+    private static void extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+        StringBuilder annotationText = new StringBuilder()
+        boolean inAnnotation = false
+        file.eachLine { line ->
+            line = line.trim()
+            if (line.contains(annotationName)) {
+                inAnnotation = true
+            }
+            if (inAnnotation) {
+                annotationText.append(line)
+                if (line.contains(")")) {
+                    inAnnotation = false
+                    def matcher = keyValuePattern.matcher(annotationText.toString())
+                    while (matcher.find()) {
+                        def key = matcher.group(1)
+                        def value = matcher.group(2)
+                        processProperty.call(key, value)
+                    }
+                }
+            }
+        }
+    }
+}
+tasks.register('generateReleaseProperties', GenerateReleasePropertiesTask) {
+    group = 'build'
+    description = 'Generates release.properties file with extension version and domain information'
+}
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+}
+jar {
+    // This task ensures that release.properties is read *after* it has been generated.
+    // Gradle's configuration phase runs before tasks like `generateReleaseProperties` execute,
+    // so directly reading the release.properties file earlier results in missing or default values.
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn ':base-authentication:jar'
+    archiveBaseName = "krista_client_authentication-extension"
+
+    sourceCompatibility = '21'
+    targetCompatibility = '21'
+
+    from {
+        configurations.runtimeClasspath.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+System.setProperty("extensionVersion", version as String)
+
+dependencies {
+    // Internal project dependencies
+    implementation project(':base-authentication')
+    annotationProcessor 'app.krista:extension-impl-anno-processors:1.0.120'
+
+    compileOnly 'app.krista:krista-apis:1.0.121-rc1'
+    compileOnly 'org.glassfish.hk2:hk2-api:3.0.5'
+
+    // Test dependencies
+
+    // JAX-RS API
+    compileOnly 'jakarta.ws.rs:jakarta.ws.rs-api:3.1.0'
+    compileOnly 'jakarta.inject:jakarta.inject-api:2.0.1'
+
+    // Test Dependencies
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter-params:5.10.0'
+    testImplementation 'org.mockito:mockito-core:5.5.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.5.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // Test-only Krista APIs
+    testImplementation 'app.krista:krista-apis:1.0.121-rc1'
+}
