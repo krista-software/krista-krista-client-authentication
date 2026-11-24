@@ -48,3 +48,5 @@ Thumbs.db
 *.mov
 *.wmv
 
+base-authentication/gradle.properties
+krista-client-authentication/gradle.properties
